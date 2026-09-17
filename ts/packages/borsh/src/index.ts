@@ -552,19 +552,17 @@ export function vecU8(property?: string): Layout<Buffer> {
  * Encodes `src` with `layout`, allocating a buffer that is guaranteed to fit
  * the serialized value.
  *
- * Fixed-size layouts allocate exactly `layout.span` bytes. Variable-size
- * layouts (Vec, String, Option, ...) start with a 1000-byte buffer and grow
- * on overflow, so values larger than the initial allocation are never dropped:
- * Buffer.copy otherwise stops silently once the destination is full, and the
- * underlying layouts surface the overrun as a RangeError.
+ * Starts with a 1000-byte buffer and grows on overflow, clamped to 10 MiB, so
+ * values larger than the initial allocation are never dropped while the cap is
+ * still enforced: `Buffer.copy` otherwise stops silently once the destination
+ * is full, and the underlying layouts surface the overrun as a RangeError. The
+ * reported length is checked too: some valid buffer-layout layouts report more
+ * bytes than the destination holds without throwing. Fixed-size layouts grow
+ * like any other — `layout.span` is not trusted for preallocation, since a
+ * spoofed or invalid input must not retain a huge backing buffer from a tiny
+ * output.
  */
 export function encodeLayout<T>(layout: Layout<T>, src: T): Buffer {
-  if (layout.span > 0) {
-    const buffer = Buffer.alloc(layout.span);
-    const len = layout.encode(src, buffer);
-    return buffer.slice(0, len);
-  }
-
   // Max serialized size is bounded by what an account/tx can hold. This is
   // far above any real value while still guarding against unbounded growth.
   const MAX_ENCODE_SIZE = 10 * 1024 * 1024;
@@ -573,20 +571,46 @@ export function encodeLayout<T>(layout: Layout<T>, src: T): Buffer {
   for (;;) {
     try {
       const len = layout.encode(src, buffer);
+      // Some valid buffer-layout layouts report more bytes than the
+      // destination holds without throwing (a Structure with a missing
+      // fixed-span field counts the un-written span), and `Buffer.slice`
+      // clamps silently — route it through the same overflow handling.
+      if (len > buffer.length) {
+        throw new RangeError(`encoding overruns Buffer: reported ${len} bytes`);
+      }
       return buffer.slice(0, len);
     } catch (err) {
-      const overflow = (e: unknown): boolean =>
-        e instanceof RangeError &&
-        /overruns Buffer|remaining bytes/.test((e as Error).message);
+      const overflow = (e: unknown): boolean => {
+        const message = (e as Error).message;
+        if (/overruns Buffer|remaining bytes/.test(message)) {
+          return true;
+        }
+        // buffer-layout's primitive writers call Node's Buffer.write* directly,
+        // which throws ERR_OUT_OF_RANGE about the write "offset" when the
+        // destination is too small. That also signals overflow — but only the
+        // offset variant: a "value" out-of-range error means the input itself
+        // is invalid and must still be rethrown, not retried.
+        const code = (e as { code?: unknown }).code;
+        if (code === "ERR_OUT_OF_RANGE" && /offset/.test(message)) {
+          return true;
+        }
+        // The npm `buffer` polyfill (browser bundles) throws a plain RangeError
+        // with no code and no "offset" text: "Index out of range" from its
+        // checkInt. The "value" out-of-bounds variants ("value" is out of
+        // range) are input errors and must still be rethrown, not retried.
+        return /Index out of range|out of range index/i.test(message);
+      };
       // Only a too-small destination overruns the buffer; other RangeErrors
       // are genuine input errors and must not be retried.
       if (!overflow(err)) {
         throw err;
       }
+      // The next allocation is clamped to the cap: an 8 MiB buffer must not
+      // become 16 MiB, so a payload beyond the cap is rejected, not honored.
       if (buffer.length >= MAX_ENCODE_SIZE) {
         throw err;
       }
-      buffer = Buffer.alloc(buffer.length * 2);
+      buffer = Buffer.alloc(Math.min(buffer.length * 2, MAX_ENCODE_SIZE));
     }
   }
 }
