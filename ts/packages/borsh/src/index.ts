@@ -575,9 +575,22 @@ export function encodeLayout<T>(layout: Layout<T>, src: T): Buffer {
       const len = layout.encode(src, buffer);
       return buffer.slice(0, len);
     } catch (err) {
-      const overflow = (e: unknown): boolean =>
-        e instanceof RangeError &&
-        /overruns Buffer|remaining bytes/.test((e as Error).message);
+      const overflow = (e: unknown): boolean => {
+        if (!(e instanceof RangeError)) {
+          return false;
+        }
+        const message = (e as Error).message;
+        if (/overruns Buffer|remaining bytes/.test(message)) {
+          return true;
+        }
+        // buffer-layout's primitive writers call Node's Buffer.write* directly,
+        // which throws ERR_OUT_OF_RANGE about the write "offset" when the
+        // destination is too small. That also signals overflow — but only the
+        // offset variant: a "value" out-of-range error means the input itself
+        // is invalid and must still be rethrown, not retried.
+        const code = (e as { code?: unknown }).code;
+        return code === "ERR_OUT_OF_RANGE" && /offset/.test(message);
+      };
       // Only a too-small destination overruns the buffer; other RangeErrors
       // are genuine input errors and must not be retried.
       if (!overflow(err)) {
